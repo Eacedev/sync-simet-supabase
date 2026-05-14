@@ -1,0 +1,25 @@
+name: Sync SIMET → Supabase
+
+on:
+  schedule:
+    - cron: '0 10 * * *'  # todo dia às 07h de Brasília
+  workflow_dispatch:        # permite rodar manualmente também
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar dependências
+        run: npm install @supabase/supabase-js
+
+      - name: Rodar sincronização
+        run: node sync.mjs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
