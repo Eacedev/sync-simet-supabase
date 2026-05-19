@@ -2,7 +2,7 @@ name: Sync SIMET → Supabase
 
 on:
   schedule:
-    - cron: '55 18 * * *'  # todo dia às 23:40h de Brasília
+    - cron: '00 22 * * *'  # todo dia às 23:40h de Brasília
   workflow_dispatch:        # permite rodar manualmente também
 
 jobs:
