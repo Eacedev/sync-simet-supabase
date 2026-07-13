@@ -37,6 +37,8 @@ const resultado = Object.entries(grupos).map(([id, medicoes]) => ({
   co_entidade: Number(id),
   dia: medicoes[0].dia,
   nome_provedor: medicoes[0].nome_provedor,
+  tipo: medicoes[0].tipo,
+  agent_id: medicoes[0].agent_id,
   asn: medicoes[0].asn,
   total_medicoes: medicoes.length,
   media_download_mbps: media(medicoes, "vel_download_mbps"),
