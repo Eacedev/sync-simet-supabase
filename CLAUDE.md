@@ -21,7 +21,7 @@ Em produção roda pelo GitHub Actions, com `SUPABASE_URL` e `SUPABASE_KEY` vind
 
 ### Variáveis de ambiente opcionais
 
-Existem porque a coleta completa leva ~20 minutos e grava direto na tabela de produção — sem elas não há como testar uma alteração de forma barata.
+Existem porque a coleta completa leva ~30 minutos e grava direto na tabela de produção — sem elas não há como testar uma alteração de forma barata.
 
 | Variável | Efeito |
 |---|---|
@@ -38,7 +38,7 @@ $env:SIMET_DRY_RUN = "1"; $env:SIMET_MAX_PAGINAS = "12"; node sync.mjs
 1. Calcula `end_time` na **meia-noite UTC do dia da execução** e `DIA_ALVO` como o dia anterior. Aborta cedo se o `end_time` já estiver a 24h ou mais no passado, caso em que a API devolveria vazio.
 2. Sonda `page=1` com `include_total=true` para obter `total_rows`, e deriva o número de páginas de `total_rows / PAGE_SIZE`.
 3. Pagina o restante com `CONCORRENCIA` requisições simultâneas, reusando o mesmo `end_time`. Cada página tem 3 tentativas com backoff; se alguma esgotar, o job aborta **sem gravar nada** — um dia com páginas faltando produziria médias silenciosamente erradas.
-4. Agrega incrementalmente, página a página, acumulando soma e contagem por `(co_entidade, dia)`. As medições cruas nunca são todas retidas em memória: são ~300-500 mil por dia, contra ~10 mil escolas no resultado.
+4. Agrega incrementalmente, página a página, acumulando soma e contagem por `(co_entidade, dia)`. As medições cruas nunca são todas retidas em memória: são ~300-520 mil por dia, contra ~80 mil escolas no resultado.
 5. Descarta medições sem `vel_download_mbps` **ou** sem `vel_upload_mbps`, e as que não pertencem ao `DIA_ALVO`.
 6. Divide soma por contagem (cada métrica tem contagem própria, então `null` de um campo não contamina os outros) e faz upsert em lotes de 500 na tabela `medicoes_simet`, com `onConflict: "co_entidade,dia"`.
 
@@ -52,17 +52,49 @@ Consequências ao mexer nisso:
 
 ## Agendamento
 
-O horário desejado é **23:40 de Brasília**. Como o cron do GitHub Actions é sempre em UTC e o Brasil não usa mais horário de verão (UTC-3 fixo), isso é `40 2 * * *`.
+O horário desejado é **21:40 de Brasília**, logo após o dia UTC fechar (21:00 BRT). Como o cron do GitHub Actions é sempre em UTC e o Brasil não usa mais horário de verão (UTC-3 fixo), isso é `40 0 * * *`.
 
-Disparando às 02:40 UTC, o `end_time` cai na meia-noite UTC daquele mesmo dia e o `DIA_ALVO` é o dia UTC anterior — já fechado, com 2h40 de folga para a ingestão da API, que fica ~30 min atrás do tempo real. Sobram ~21h de margem antes de o dia sair do ar, contra ~20 min de coleta.
+Disparando às 00:40 UTC, o `end_time` cai na meia-noite UTC daquele mesmo dia e o `DIA_ALVO` é o dia UTC anterior, recém-fechado. Sobram ~23h de margem antes de o dia sair do ar, contra ~32 min de coleta.
 
-Execuções agendadas do GitHub Actions podem atrasar em horários de pico; se o horário exato importar, não conte com precisão de minutos. O atraso é irrelevante aqui, dada a margem.
+### O cron é "não antes de", não um horário
+
+**O Actions atrasa este workflow em horas, e o atraso varia.** Medido nas execuções reais:
+
+| Cron | Execuções | Atraso |
+|---|---|---|
+| `00 23 * * *` (23:00 UTC) | 00:38, 00:48, 00:52, 01:01 UTC | 1h38 – 2h01 |
+| `40 2 * * *` (02:40 UTC) | 08:59, 09:00 UTC | ~6h20 |
+
+Foi isso que fez o job aparecer rodando às 06:00 BRT com um cron ajustado para 23:40 BRT. Não adianta "compensar" o atraso adiantando o cron: ele não é estável.
+
+Isso não corrompe dados. O `end_time` é derivado da meia-noite UTC e não do relógio do runner, então um atraso de 6h coleta exatamente o mesmo dia. O que o atraso consome é a margem de 24h da retenção — só vira problema perto de 23h, o que nunca se aproximou.
+
+Se o horário exato passar a importar, o cron do Actions não serve: seria preciso um agendador externo (pg_cron no próprio Supabase, ou um serviço de cron) chamando a API do GitHub para disparar o `workflow_dispatch`.
+
+O job tem `timeout-minutes: 75`. A coleta real levou **32 min** em 30/09/2026 e o volume cresce, então os 45 min iniciais deixavam pouca folga.
+
+Em caso de falha, um passo com `if: failure()` abre uma issue com a label `sync-simet` e o link do log. Se já houver uma issue aberta com essa label, ele comenta nela em vez de abrir outra, para uma sequência de falhas não virar uma enxurrada. Isso exige `permissions: issues: write` no workflow. O alerta existe porque a perda é silenciosa e a janela de recuperação é de um dia só; se o time preferir receber em Slack ou Teams, troque o corpo desse passo por um POST ao webhook, mantendo o `if: failure()`.
+
+### Números de uma execução real (30/09/2026, dia alvo 29/09)
+
+Use como referência ao avaliar se algo saiu do normal:
+
+```
+end_time: 2026-09-30 00:00:00 UTC | dia alvo: 2026-09-29
+Total de medições: 520543 em 521 páginas
+Páginas: 521/521 (32.1 min)
+Medições válidas: 508657 | sem download/upload: 11886
+Escolas únicas: 80155
+Salvos: 80155/80155
+```
+
+Nenhuma medição foi descartada por pertencer a outro dia, o que confirma o alinhamento da janela.
 
 ## API do SIMET
 
 A API é pública, sem autenticação, e tem rate limit de 400 req/s (cabeçalhos `X-RateLimit-*`). Não há documentação publicada: `/docs`, `/openapi.json` e `/swagger.json` retornam 404.
 
-**A chamada sem parâmetros não funciona mais.** Ela responde HTTP 500 (`{"error":"500 - Internal server error"}`) de forma persistente, porque o volume cresceu além do que o backend consegue serializar de uma vez: são ~488 mil medições em 24h. A única forma de obter os dados hoje é paginando.
+**A chamada sem parâmetros não funciona mais.** Ela responde HTTP 500 (`{"error":"500 - Internal server error"}`) de forma persistente, porque o volume cresceu além do que o backend consegue serializar de uma vez: são ~520 mil medições em 24h, e crescendo. A única forma de obter os dados hoje é paginando.
 
 ### Parâmetros de paginação
 
@@ -71,7 +103,7 @@ A API é pública, sem autenticação, e tem rate limit de 400 req/s (cabeçalho
 - `page_size` é **capado em 1000** — pedir 5000, 10000 ou 50000 devolve 1000 assim mesmo, sem erro. Um dia inteiro dá entre ~290 e ~490 páginas, conforme o movimento do dia.
 - `include_total=true` acrescenta `total_rows` e `total_pages` à resposta. O SIMET recomenda usá-lo só na primeira chamada. `total_pages` é calculado para o `page_size` **daquela requisição** — se a sondagem inicial usar um `page_size` diferente do da coleta, esse número não serve; calcule a partir de `total_rows`.
 - Os metadados (`total_rows`, `total_pages`, `end_time`) vêm **repetidos dentro de cada registro**, não num envelope. Não existe objeto de paginação; leia-os do primeiro elemento do array.
-- `end_time` ausente = "agora". **A janela é ancorada no `end_time`**, não no relógio — ver abaixo. Reusar o mesmo `end_time` devolve exatamente o mesmo `total_rows`: as chamadas são reprodutíveis, então dá para repetir uma página que falhou sem risco de inconsistência. É por isso que o `end_time` tem que ser fixado uma vez e reusado em toda a coleta; sem ele, a janela deslizaria durante os ~20 min de paginação e o `OFFSET` deslocaria registros entre páginas.
+- `end_time` ausente = "agora". **A janela é ancorada no `end_time`**, não no relógio — ver abaixo. Reusar o mesmo `end_time` devolve exatamente o mesmo `total_rows`: as chamadas são reprodutíveis, então dá para repetir uma página que falhou sem risco de inconsistência. É por isso que o `end_time` tem que ser fixado uma vez e reusado em toda a coleta; sem ele, a janela deslizaria durante os ~30 min de paginação e o `OFFSET` deslocaria registros entre páginas.
 - Pedir uma página acima de `total_pages` devolve **HTTP 500**, não um array vazio. O fim da coleta tem que ser controlado por `total_pages`/`total_rows`; um 500 no meio da paginação é ambíguo entre erro real e fim dos dados.
 
 ### O modelo da janela (e o limite do `end_time`)
@@ -88,11 +120,11 @@ Consequência operacional: a recuperação de uma falha é possível **durante t
 
 `horario_medicao` e `dia` estão em **UTC**, não em horário de Brasília. O `dia` gravado no Supabase é portanto o dia UTC, que vira às 21:00 BRT.
 
-Como a janela é "últimas 24h" e não um dia-calendário, **uma coleta sempre atravessa duas datas**: numa amostra de 3.802 registros apareceram `2026-09-28` (3.000) e `2026-09-27` (802), com 22 escolas presentes nas duas. Isso interage mal com o agrupamento atual — ver abaixo.
+Uma janela de "últimas 24h" **sempre atravessa duas datas** — numa amostra de 3.802 registros apareceram `2026-09-28` (3.000) e `2026-09-27` (802), com 22 escolas nas duas. É exatamente por isso que o `end_time` é ancorado na meia-noite: sem esse alinhamento, o agrupamento por `(co_entidade, dia)` misturaria dois dias numa média só.
 
 ### Desempenho
 
-Cada página leva ~11-12s, **constante** independente do número da página (não há degradação por `OFFSET`). Sequencialmente, 488 páginas levariam ~1h40. Em paralelo não houve nenhuma falha até 16 requisições simultâneas, mas o ganho satura cedo: ~29 min com concorrência 8, ~25 min com 16. O gargalo é o backend, não o rate limit.
+Cada página leva ~11-12s, **constante** independente do número da página (não há degradação por `OFFSET`). Sequencialmente, 500 páginas levariam ~1h40. Em paralelo não houve nenhuma falha até 16 requisições simultâneas, mas o ganho satura cedo. Com a concorrência 8 em uso, a coleta real de 521 páginas levou **32 min** — o gargalo é o backend, não o rate limit.
 
 ## Ambiente
 

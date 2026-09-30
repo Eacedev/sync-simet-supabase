@@ -131,7 +131,7 @@ if (horasDesdeEndTime >= 24) {
 if (horasDesdeEndTime > 20) {
   console.warn(
     `Atenção: faltam apenas ${(24 - horasDesdeEndTime).toFixed(1)}h para o dia ` +
-      `${DIA_ALVO} sair do ar. A coleta leva ~20 min.`
+      `${DIA_ALVO} sair do ar. A coleta leva ~30 min.`
   );
 }
 
