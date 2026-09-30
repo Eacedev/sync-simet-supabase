@@ -5,11 +5,25 @@ const API_URL =
 const PAGE_SIZE = 1000; // teto da API: pedir mais devolve 1000 do mesmo jeito
 const CONCORRENCIA = 8; // acima disso o ganho satura, o gargalo é o backend
 const TENTATIVAS = 3;
-const BATCH = 500;
+// O lote é fechado por orçamento de bytes, não por número de linhas: com o
+// detalhe, uma escola pode pesar 59 KB e outra 400 bytes, então contar linhas
+// não diz quanto o request vai pesar. O teto de linhas é só um segundo freio.
+const MAX_LINHAS_LOTE = 250;
+const MAX_BYTES_LOTE = 1_000_000;
 
 // Ajudam a testar sem esperar a coleta inteira nem gravar no Supabase
 const DRY_RUN = process.env.SIMET_DRY_RUN === "1";
 const MAX_PAGINAS = Number(process.env.SIMET_MAX_PAGINAS) || Infinity;
+// Permite ensaiar a escrita numa tabela espelho. O dry-run não exercita o
+// upsert, que é justamente a parte arriscada: payload, tipos e cache de schema
+// do PostgREST só aparecem quando se grava de verdade.
+const TABELA = process.env.SIMET_TABELA || "medicoes_simet";
+// O detalhe vive numa tabela própria, com a mesma chave (co_entidade, dia).
+// Medido em 30/09/2026: com o jsonb na tabela principal a linha ia de 157 para
+// 745 bytes e a agregação das matviews de 154 ms para 1111 ms — elas arrastavam
+// o detalhe em toda varredura para nunca usá-lo. O TOAST não resolve: nessa
+// faixa de tamanho ele não é acionado nem com toast_tuple_target=128.
+const TABELA_DETALHE = `${TABELA}_detalhe`;
 
 // A API entrega horario_medicao e dia em UTC, então o recorte segue o dia UTC.
 // A janela é [end_time - 24h, end_time), logo end_time na meia-noite UTC de hoje
@@ -29,14 +43,69 @@ const DIA_ALVO = new Date(new Date(END_TIME.replace(" ", "T") + "Z") - 1000)
 const horasDesdeEndTime =
   (agora - new Date(END_TIME.replace(" ", "T") + "Z")) / 3_600_000;
 
-const CAMPOS = {
-  media_download_mbps: "vel_download_mbps",
-  media_upload_mbps: "vel_upload_mbps",
-  media_latencia_ms: "latencia_ms",
-  media_perda_pacote: "perda_pacote_porcent",
-  media_jitter_upload_ms: "jitter_upload_ms",
-  media_jitter_download_ms: "jitter_download_ms",
-};
+// Fonte única da verdade sobre as métricas. `serie` é a chave dentro do jsonb
+// de detalhe; `media` e `percentil` dão os nomes das colunas no Supabase.
+// Jitter e perda não têm percentil: essas colunas nunca expiram e custariam
+// ~5 GB/ano, enquanto os percentis deles seguem calculáveis a partir do
+// detalhe enquanto ele existir (180 dias).
+const METRICAS = [
+  { campo: "vel_download_mbps",    serie: "d",  media: "media_download_mbps",      percentil: "download_mbps" },
+  { campo: "vel_upload_mbps",      serie: "u",  media: "media_upload_mbps",        percentil: "upload_mbps" },
+  { campo: "latencia_ms",          serie: "l",  media: "media_latencia_ms",        percentil: "latencia_ms" },
+  { campo: "perda_pacote_porcent", serie: "p",  media: "media_perda_pacote",       percentil: null },
+  { campo: "jitter_upload_ms",     serie: "ju", media: "media_jitter_upload_ms",   percentil: null },
+  { campo: "jitter_download_ms",   serie: "jd", media: "media_jitter_download_ms", percentil: null },
+];
+// o índice 0 de cada tupla é o horário; os demais seguem a ordem de METRICAS
+const SERIES = ["h", ...METRICAS.map((m) => m.serie)];
+
+// As médias já vinham como dízimas de 17 dígitos; com os percentis seriam 9
+// colunas assim. Os valores do detalhe não passam por aqui: a API devolve no
+// máximo 4 casas, então guardá-los como vieram já é exato.
+const arredondar = (v) => (v == null ? null : Math.round(v * 1e4) / 1e4);
+
+// Método R-7: é exatamente o que percentile_cont do Postgres faz, então dá para
+// conferir qualquer coluna rodando percentile_cont sobre o próprio jsonb.
+// A mediana com n par cai aqui como caso particular.
+function percentil(ordenados, q) {
+  if (ordenados.length === 0) return null;
+  const h = (ordenados.length - 1) * q;
+  const piso = Math.floor(h);
+  const teto = Math.ceil(h);
+  if (piso === teto) return ordenados[piso];
+  return ordenados[piso] + (h - piso) * (ordenados[teto] - ordenados[piso]);
+}
+
+// Ordena as medições de uma escola por horário. O desempate pelos valores é
+// necessário porque o sort do V8 é estável: sem ele, medições que dividem o
+// horário manteriam a ordem de chegada das páginas, que varia com a
+// concorrência e tornaria a linha irreproduzível entre execuções.
+function compararTupla(a, b) {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === b[i]) continue;
+    if (a[i] == null) return -1;
+    if (b[i] == null) return 1;
+    return a[i] < b[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+// Mesmo padrão de retry para a coleta e para a gravação. O upsert não tinha
+// nenhum: um 5xx transitório no meio dos lotes matava o job e o dia junto,
+// já que a API só guarda 24h.
+async function comTentativas(descricao, executar) {
+  for (let tentativa = 1; tentativa <= TENTATIVAS; tentativa++) {
+    try {
+      return await executar();
+    } catch (e) {
+      if (tentativa === TENTATIVAS)
+        throw new Error(
+          `${descricao} falhou após ${TENTATIVAS} tentativas: ${e.message}`
+        );
+      await new Promise((r) => setTimeout(r, 5000 * tentativa));
+    }
+  }
+}
 
 async function buscarPagina(pagina, incluirTotal = false) {
   const url =
@@ -44,35 +113,30 @@ async function buscarPagina(pagina, incluirTotal = false) {
     `&end_time=${encodeURIComponent(END_TIME)}` +
     (incluirTotal ? "&include_total=true" : "");
 
-  for (let tentativa = 1; tentativa <= TENTATIVAS; tentativa++) {
-    try {
-      const res = await fetch(url);
-      const corpo = await res.text();
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${corpo.slice(0, 150)}`);
+  return comTentativas(`página ${pagina}`, async () => {
+    const res = await fetch(url);
+    const corpo = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${corpo.slice(0, 150)}`);
 
-      const dados = JSON.parse(corpo);
-      // fora da janela aceita, a API responde {} com HTTP 200
-      if (!Array.isArray(dados))
-        throw new Error(`esperava array, veio ${corpo.slice(0, 150)}`);
-      return dados;
-    } catch (e) {
-      if (tentativa === TENTATIVAS)
-        throw new Error(
-          `página ${pagina} falhou após ${TENTATIVAS} tentativas: ${e.message}`
-        );
-      await new Promise((r) => setTimeout(r, 5000 * tentativa));
-    }
-  }
+    const dados = JSON.parse(corpo);
+    // fora da janela aceita, a API responde {} com HTTP 200
+    if (!Array.isArray(dados))
+      throw new Error(`esperava array, veio ${corpo.slice(0, 150)}`);
+    return dados;
+  });
 }
 
-// Agrega incrementalmente: guardar as ~300 mil medições cruas em memória seria
-// desnecessário, já que só precisamos de soma e contagem por escola.
+// Agrega por escola guardando as medições individuais. São ~508 mil por dia,
+// o que custa ~119 MB de heap (medido) contra os 16 GB do runner — cabe, e é
+// o que permite gravar o detalhe e calcular mediana e percentis.
 const grupos = new Map();
 let semVelocidade = 0;
 let deOutroDia = 0;
 let processadas = 0;
+let recebidas = 0;
 
 function acumular(medicoes) {
+  recebidas += medicoes.length;
   for (const m of medicoes) {
     if (m.vel_download_mbps == null || m.vel_upload_mbps == null) {
       semVelocidade++;
@@ -92,35 +156,34 @@ function acumular(medicoes) {
       g = {
         co_entidade: Number(m.co_entidade),
         dia: m.dia,
-        total_medicoes: 0,
-        somas: {},
-        contagens: {},
-        horarioRef: "",
+        medicoes: [],
+        chaveRef: "",
       };
       grupos.set(chave, g);
     }
 
-    g.total_medicoes++;
-    // metadados vêm da medição mais recente do grupo; comparar o horário mantém
-    // o resultado estável mesmo com as páginas chegando fora de ordem
-    if (m.horario_medicao > g.horarioRef) {
-      g.horarioRef = m.horario_medicao;
+    // uma tupla-array por medição, não um objeto: com meio milhão de medições,
+    // repetir as chaves custaria centenas de MB de heap
+    const tupla = [m.horario_medicao.slice(11)];
+    for (const met of METRICAS) tupla.push(m[met.campo] ?? null);
+    g.medicoes.push(tupla);
+
+    // metadados vêm da medição mais recente do grupo; o desempate por agent_id
+    // mantém o resultado estável quando duas medições dividem o horário — sem
+    // ele seria a ordem de chegada das páginas a decidir
+    const chaveRef = `${m.horario_medicao}|${m.agent_id ?? ""}`;
+    if (chaveRef > g.chaveRef) {
+      g.chaveRef = chaveRef;
       g.nome_provedor = m.nome_provedor;
       g.tipo = m.tipo;
       g.agent_id = m.agent_id;
       g.asn = m.asn;
     }
-
-    for (const campo of Object.values(CAMPOS)) {
-      const v = m[campo];
-      if (v == null) continue;
-      g.somas[campo] = (g.somas[campo] || 0) + v;
-      g.contagens[campo] = (g.contagens[campo] || 0) + 1;
-    }
   }
 }
 
 console.log(`end_time: ${END_TIME} UTC | dia alvo: ${DIA_ALVO}`);
+if (TABELA !== "medicoes_simet") console.log(`Tabela de destino: ${TABELA}`);
 if (horasDesdeEndTime >= 24) {
   console.error(
     `end_time está ${horasDesdeEndTime.toFixed(1)}h no passado; a API só aceita ` +
@@ -186,7 +249,26 @@ console.log(
     (deOutroDia ? ` | de outro dia (descartadas): ${deOutroDia}` : "")
 );
 
-const resultado = [...grupos.values()].map((g) => {
+// A paginação da API não é perfeitamente estável: duas coletas com o mesmo
+// end_time podem devolver alguns registros a mais ou a menos, porque o OFFSET
+// do backend não tem uma ordenação determinística por baixo. O efeito medido é
+// pequeno (~0,01%), mas só dá para saber que aconteceu comparando o total
+// recebido com o total anunciado.
+if (totalPaginas === Math.ceil(totalRows / PAGE_SIZE) && recebidas !== totalRows) {
+  const delta = recebidas - totalRows;
+  console.warn(
+    `Atenção: a API anunciou ${totalRows} medições e entregou ${recebidas} ` +
+      `(${delta > 0 ? "+" : ""}${delta}, ${((delta / totalRows) * 100).toFixed(3)}%). ` +
+      `Instabilidade da paginação; as médias do dia saem com essa amostra.`
+  );
+}
+
+const resultado = [];
+const detalhes = [];
+
+for (const g of grupos.values()) {
+  g.medicoes.sort(compararTupla);
+
   const linha = {
     co_entidade: g.co_entidade,
     dia: g.dia,
@@ -194,17 +276,42 @@ const resultado = [...grupos.values()].map((g) => {
     tipo: g.tipo,
     agent_id: g.agent_id,
     asn: g.asn,
-    total_medicoes: g.total_medicoes,
+    total_medicoes: g.medicoes.length,
   };
-  for (const [destino, origem] of Object.entries(CAMPOS)) {
-    linha[destino] = g.contagens[origem]
-      ? g.somas[origem] / g.contagens[origem]
-      : null;
-  }
-  return linha;
-});
 
-console.log("Escolas únicas:", resultado.length);
+  const detalhe = { h: g.medicoes.map((t) => t[0]) };
+
+  METRICAS.forEach((met, i) => {
+    const coluna = i + 1; // o índice 0 da tupla é o horário
+    detalhe[met.serie] = g.medicoes.map((t) => t[coluna]);
+
+    // cada métrica tem o próprio n: uma latência nula não pode encolher a
+    // amostra de download nem contaminar a média dele
+    const valores = [];
+    for (const t of g.medicoes) if (t[coluna] != null) valores.push(t[coluna]);
+    valores.sort((a, b) => a - b);
+
+    linha[met.media] = valores.length
+      ? arredondar(valores.reduce((a, b) => a + b, 0) / valores.length)
+      : null;
+
+    if (met.percentil) {
+      linha[`mediana_${met.percentil}`] = arredondar(percentil(valores, 0.5));
+      linha[`p10_${met.percentil}`] = arredondar(percentil(valores, 0.1));
+      linha[`p90_${met.percentil}`] = arredondar(percentil(valores, 0.9));
+    }
+  });
+
+  resultado.push(linha);
+  detalhes.push({ co_entidade: g.co_entidade, dia: g.dia, medicoes: detalhe });
+}
+
+// nada impede um agente defeituoso medindo a cada minuto (1440 medições ~ 59 KB
+// numa linha só); acompanhar o máximo revela a deriva antes de virar incidente
+const maxMedicoes = resultado.reduce((a, l) => Math.max(a, l.total_medicoes), 0);
+console.log(
+  `Escolas únicas: ${resultado.length} | máx. de medições numa escola: ${maxMedicoes}`
+);
 
 if (resultado.length === 0) {
   console.warn("Nenhuma medição válida no período. Nada a gravar.");
@@ -212,25 +319,86 @@ if (resultado.length === 0) {
 }
 
 if (DRY_RUN) {
-  console.log("SIMET_DRY_RUN=1, nada será gravado. Exemplo de linha:");
-  console.log(JSON.stringify(resultado[0], null, 2));
+  const i = Math.max(
+    0,
+    resultado.findIndex((l) => l.total_medicoes >= 5)
+  );
+  const exemplo = resultado[i];
+  const detalhe = detalhes[i].medicoes;
+  console.log(`SIMET_DRY_RUN=1, nada será gravado. Exemplo de ${TABELA}:`);
+  console.log(JSON.stringify(exemplo, null, 2));
+  console.log(
+    `${TABELA_DETALHE} (${exemplo.total_medicoes} medições, 3 primeiras de cada série):`
+  );
+  for (const s of SERIES) {
+    console.log(
+      `  ${s.padEnd(2)}: ${JSON.stringify(detalhe[s].slice(0, 3))}` +
+        ` (${detalhe[s].length} itens)`
+    );
+  }
+  console.log(
+    `bytes por linha — agregada: ${JSON.stringify(exemplo).length} | ` +
+      `detalhe: ${JSON.stringify(detalhes[i]).length}`
+  );
   process.exit(0);
 }
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-let salvos = 0;
-for (let i = 0; i < resultado.length; i += BATCH) {
-  const lote = resultado.slice(i, i + BATCH);
-  const { error } = await supabase
-    .from("medicoes_simet")
-    .upsert(lote, { onConflict: "co_entidade,dia" });
-  if (error) {
-    console.error("Erro no lote", i, error);
-    process.exit(1);
+// Fecha os lotes por orçamento de bytes para o request não estourar por causa
+// de poucas escolas com centenas de medições.
+function lotear(linhas) {
+  const lotes = [];
+  let atual = [];
+  let bytes = 0;
+  for (const linha of linhas) {
+    const tamanho = JSON.stringify(linha).length;
+    if (
+      atual.length &&
+      (atual.length >= MAX_LINHAS_LOTE || bytes + tamanho > MAX_BYTES_LOTE)
+    ) {
+      lotes.push(atual);
+      atual = [];
+      bytes = 0;
+    }
+    atual.push(linha);
+    bytes += tamanho;
   }
-  salvos += lote.length;
-  console.log(`Salvos: ${salvos}/${resultado.length}`);
+  if (atual.length) lotes.push(atual);
+  return lotes;
 }
+
+async function gravar(tabela, linhas) {
+  const lotes = lotear(linhas);
+  let salvos = 0;
+  for (const [i, lote] of lotes.entries()) {
+    try {
+      await comTentativas(`${tabela} lote ${i + 1}/${lotes.length}`, async () => {
+        const { error } = await supabase
+          .from(tabela)
+          .upsert(lote, { onConflict: "co_entidade,dia" });
+        if (error) throw new Error(error.message);
+      });
+    } catch (e) {
+      // os lotes anteriores já foram gravados: não há transação nem rollback.
+      // Reexecutar é seguro por ser upsert idempotente sobre o mesmo end_time.
+      console.error(`Erro ao gravar em ${tabela}: ${e.message}`);
+      console.error(
+        `Parou no lote ${i + 1} de ${lotes.length}; ${salvos} linhas gravadas.`
+      );
+      process.exit(1);
+    }
+    salvos += lote.length;
+    if ((i + 1) % 20 === 0 || i === lotes.length - 1) {
+      console.log(`${tabela}: ${salvos}/${linhas.length}`);
+    }
+  }
+}
+
+// A agregada vai primeiro: é o que as views consomem. Se o detalhe falhar
+// depois, o dia continua correto para quem lê médias e percentis, e basta
+// reexecutar para completar.
+await gravar(TABELA, resultado);
+await gravar(TABELA_DETALHE, detalhes);
 
 console.log("Concluído!");
